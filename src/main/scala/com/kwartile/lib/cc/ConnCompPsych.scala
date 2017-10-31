@@ -88,7 +88,7 @@ object ConnCompPsych extends Serializable {
     * @param nodePairs on which to apply Large Star operations
     * @return new nodePairs after the operation and conncectivy change count
     */
-  def largeStar(nodePairs: RDD[(Long, Long)]): (RDD[(Long, Long)], Int) = {
+  def largeStar(nodePairs: RDD[(Long, Long)]): (RDD[(Long, Long)], Long) = {
 
     /**
       * generate RDD of (self, List(neighbors))
@@ -96,7 +96,7 @@ object ConnCompPsych extends Serializable {
       * will result into (4, List(1)), (1, List(4)), (6, List(1)), (1, List(6)), (3, List(2)), (2, List(3)), (6, List(5)), (5, List(6))
       */
 
-    val neighbors = nodePairs.flatMap(x => {
+    val pairs = nodePairs.flatMap(x => {
       val (self, neighbor) = (x._1, x._2)
       if (self == neighbor)
         List((self, neighbor))
@@ -116,41 +116,33 @@ object ConnCompPsych extends Serializable {
 
     val localAdd = (s: mutable.HashSet[Long], v: Long) => s += v
     val partitionAdd = (s1: mutable.HashSet[Long], s2: mutable.HashSet[Long]) => s1 ++= s2
-    val allNeighbors = neighbors.aggregateByKey(mutable.HashSet.empty[Long] /*, rangePartitioner*/)(localAdd, partitionAdd)
+    val allNeighbors = pairs.aggregateByKey(mutable.HashSet.empty[Long] /*, rangePartitioner*/)(localAdd, partitionAdd)
 
     /**
       * Apply Large Star operation on (self, List(neighbor)) to get newNodePairs and count the change in connectivity
       */
 
-    val newNodePairsWithChangeCount = allNeighbors.map(x => {
-      val self = x._1
-      val neighbors = x._2.toSet
-      val minVertex = argMin(neighbors + self)
-      val newNodePairs = (neighbors + self).map(neighbor => {
+    val newNodePairs = allNeighbors.flatMap { case (self, neighbors) =>
+      val minVertex = argMin(neighbors.toSet + self)
+      val uniqueNewNodePairs = (neighbors + self).map(neighbor => {
         (neighbor, minVertex)
       }).filter(x => {
         val neighbor = x._1
         val minVertex = x._2
         (neighbor > self && neighbor != minVertex) || (neighbor == self)
-      })
+      }).toSet
+      uniqueNewNodePairs
+    }.persist(StorageLevel.MEMORY_AND_DISK_SER)
 
-      val uniqueNewNodePairs = newNodePairs
-      val connectivtyChangeCount = (uniqueNewNodePairs diff neighbors.map((self, _))).size
-      (uniqueNewNodePairs, connectivtyChangeCount)
-    }).persist(StorageLevel.MEMORY_AND_DISK_SER)
+    //    val connectivtyChangeCount = (uniqueNewNodePairs diff neighbors.map((self, _))).size
+    //    (uniqueNewNodePairs, connectivtyChangeCount)
 
-    val totalConnectivityCountChange = newNodePairsWithChangeCount.mapPartitions(iter => {
-      val (_, l) = iter.toSeq.unzip
-      val sum = l.sum
-      Iterator(sum)
-    }).sum.toInt
+    val connsChange = pairs.filter(x => x._1 >= x._2).subtract(newNodePairs).count
 
     /**
       * Sum all the changeCounts
       */
-    val newNodePairs = newNodePairsWithChangeCount.map(x => x._1).flatMap(x => x)
-    newNodePairsWithChangeCount.unpersist(false)
-    (newNodePairs, totalConnectivityCountChange)
+    (newNodePairs, connsChange)
   }
 
   private def argMin(nodes: Set[Long]): Long = {
@@ -207,9 +199,14 @@ object ConnCompPsych extends Serializable {
     */
 
   @tailrec
-  private def alternatingAlgo(nodePairs: RDD[(Long, Long)],
-                              largeStarConnectivityChangeCount: Long, smallStarConnectivityChangeCount: Long, didConverge: Boolean,
-                              currIterationCount: Int, maxIterationCount: Int): (RDD[(Long, Long)], Boolean, Int) = {
+  private def alternatingAlgo(
+                               nodePairs: RDD[(Long, Long)],
+                               largeStarConnectivityChangeCount: Long,
+                               smallStarConnectivityChangeCount: Long,
+                               didConverge: Boolean,
+                               currIterationCount: Int,
+                               maxIterationCount: Int
+                             ): (RDD[(Long, Long)], Boolean, Int) = {
 
     val iterationCount = currIterationCount + 1
     if (didConverge)
@@ -245,14 +242,14 @@ object ConnCompPsych extends Serializable {
     */
   def run(cliques: RDD[List[Long]], maxIterationCount: Int): (RDD[(Long, Long)], Boolean, Int) = {
 
-    val nodePairs = cliques.map(clique => buildPairs(clique)).flatMap(identity)
+    val nodePairs: RDD[(Long, Long)] = cliques.map(clique => buildPairs(clique)).flatMap(identity)
 
-    val (cc, didConverge, iterCount) = alternatingAlgo(nodePairs, 9999999, 9999999, didConverge = false, 0, maxIterationCount)
+    val (cc, ifConverge, iterCount) = alternatingAlgo(nodePairs, 9999999, 9999999, didConverge = false, 0, maxIterationCount)
 
-    if (didConverge) {
-      (cc, didConverge, iterCount)
+    if (ifConverge) {
+      (cc, ifConverge, iterCount)
     } else {
-      (null.asInstanceOf[RDD[(Long, Long)]], didConverge, iterCount)
+      (null.asInstanceOf[RDD[(Long, Long)]], ifConverge, iterCount)
     }
   }
 }
